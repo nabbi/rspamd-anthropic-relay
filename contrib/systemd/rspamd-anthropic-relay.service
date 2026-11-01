@@ -36,7 +36,9 @@ SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources
 UMask=0077
-MemoryMax=200M
+# Sized for RELAY_BACKEND=direct (~25 MiB idle); 200M for sdk (docs/backends.md)
+MemoryMax=128M
+# One thread per connection: keep RELAY_MAX_CONNECTIONS (32) well under it
 TasksMax=64
 
 [Install]

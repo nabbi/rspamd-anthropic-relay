@@ -5,14 +5,17 @@ own Messages API.
 
 rspamd's `gpt` module speaks only the OpenAI Chat Completions format (its
 types are `openai` and `ollama`). This relay listens on a local address,
-takes the module's request, sends it to Claude with the official
-[Anthropic Python SDK](https://github.com/anthropics/anthropic-sdk-python),
-and answers in the shape the module parses. rspamd itself stays stock:
+takes the module's request, sends it to Claude's Messages API, and
+answers in the shape the module parses. It needs nothing beyond the
+Python standard library; the official
+[Anthropic Python SDK](https://github.com/anthropics/anthropic-sdk-python)
+can make the call instead (`RELAY_BACKEND=sdk`, see
+[docs/backends.md](docs/backends.md)). rspamd itself stays stock:
 `type = "openai"` with `url` pointing at the relay.
 
 ```
 rspamd (gpt module) --HTTP, loopback--> relay --HTTPS--> api.anthropic.com/v1/messages
-      OpenAI chat completions                     Anthropic Messages API (SDK)
+      OpenAI chat completions                     Anthropic Messages API
 ```
 
 Why not Anthropic's OpenAI-compatible endpoint? It works for trying
@@ -43,7 +46,10 @@ is small enough to read in one sitting (`src/rspamd_anthropic_relay/relay.py`).
   when a body is announced but not sent within `RELAY_READ_TIMEOUT`, 413
   when the body or the messages are too large, 429 when Anthropic
   rate-limits, 502 for other upstream errors, 503 when
-  `RELAY_MAX_CONCURRENT` requests are already in flight, 504 on timeout.
+  `RELAY_MAX_CONCURRENT` requests are already in flight (or
+  `RELAY_MAX_CONNECTIONS` connections are open), 504 on timeout. A wrong
+  token, an unknown path and a 503 are answered on the headers, before
+  the body is read, and the connection is closed.
   rspamd adds no symbol for a failed request, so mail keeps flowing.
 - One log line per request: path, status, time, model, Anthropic's message
   id, stop reason and token counts. Never the message content, the token
@@ -98,17 +104,21 @@ which may quote the mail, into every message's headers.
 
 ## Install
 
-Python 3.11 or later (the pinned httpx2 stack needs it).
+Python 3.11 or later. No other dependencies:
 
 ```sh
 python3 -m venv /opt/rspamd-anthropic-relay/venv
-/opt/rspamd-anthropic-relay/venv/bin/pip install --require-hashes -r requirements.txt
 /opt/rspamd-anthropic-relay/venv/bin/pip install --no-deps .
 ```
 
-`requirements.txt` pins every dependency with hashes (`pip-compile
---generate-hashes`). Without the package install, run it from a checkout:
+Without the package install, run it from a checkout:
 `PYTHONPATH=src python -m rspamd_anthropic_relay`.
+
+For `RELAY_BACKEND=sdk`, install the SDK first, from
+`requirements-sdk.txt`, which pins it and its dependencies with hashes:
+`pip install --require-hashes -r requirements-sdk.txt`. See
+[docs/backends.md](docs/backends.md) for why the default is the
+standard library, and how to switch.
 
 Create an unprivileged account for it (the service files use
 `rspamd-relay`) and its settings file, mode 0600, owned by that account:
@@ -126,7 +136,8 @@ Environment variables, or `KEY=value` lines in the file given with
 | --- | --- | --- |
 | `ANTHROPIC_API_KEY` / `ANTHROPIC_API_KEY_FILE` | required | The Anthropic API key, or a file holding it |
 | `RELAY_TOKEN` / `RELAY_TOKEN_FILE` | required | What rspamd must send as `Authorization: Bearer` (its `api_key`) |
-| `ANTHROPIC_BASE_URL` | the SDK's | Another Messages API endpoint (a test server, a gateway) |
+| `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` | Another Messages API endpoint (a test server, a gateway); a path is kept as a prefix |
+| `RELAY_BACKEND` | `direct` | `direct` (standard library) or `sdk` (the Anthropic SDK, installed separately; it also honours `HTTPS_PROXY`): [docs/backends.md](docs/backends.md) |
 | `RELAY_LISTEN` | `127.0.0.1:11338` | `host:port`; `[::1]:11338` for IPv6 |
 | `RELAY_MODEL` | `claude-haiku-5-5` | The Claude model every request uses |
 | `RELAY_MAX_TOKENS` | `512` | Cap on the reply's tokens |
@@ -134,9 +145,11 @@ Environment variables, or `KEY=value` lines in the file given with
 | `RELAY_EFFORT` | `low` | `low` … `max`, or empty for the model's default |
 | `RELAY_TIMEOUT` | `4.5` | Seconds for the Anthropic call; keep it under rspamd's `timeout` |
 | `RELAY_MAX_CONCURRENT` | `4` | Requests in flight before answering 503 |
-| `RELAY_MAX_BODY` | `1048576` | Request size limit in bytes, before and after decompression |
+| `RELAY_MAX_CONNECTIONS` | `32` | Open client connections (one thread each); more get a 503 and are closed |
+| `RELAY_MAX_BODY` | `524288` | Request size limit in bytes, before and after decompression |
 | `RELAY_MAX_INPUT_CHARS` | `100000` | Limit on the text of all messages in a request, in characters |
 | `RELAY_READ_TIMEOUT` | `10` | Seconds a client has to send the body it announced |
+| `RELAY_IDLE_TIMEOUT` | `60` | Seconds a connection may stay silent (before its request, or kept alive between requests) before it is closed |
 | `RELAY_GUARD` | `on` | `off` sends the messages as they are: no tags, no guard instruction ("Untrusted input") |
 | `RELAY_LOG` | `stderr` | `stderr` or `syslog` (also `--log`) |
 | `RELAY_SYSLOG_FACILITY` | `mail` | |
@@ -191,12 +204,14 @@ sure that is acceptable for the mail you handle.
 ## Test
 
 ```sh
-python -m pip install --require-hashes -r requirements.txt
 python -m pip install --no-deps -e .
 python -m unittest discover -s tests -v
 ```
 
-The tests use a fake Anthropic client and send no requests. To try a
+With the SDK installed too (`requirements-sdk.txt`), the tests also check
+that the direct client sends what the SDK sends (`SdkParityTest`,
+[docs/backends.md](docs/backends.md)); without it those are skipped.
+The tests use a fake Anthropic API on loopback and send no requests out. To try a
 running relay by hand:
 
 ```sh

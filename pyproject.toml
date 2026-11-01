@@ -10,11 +10,16 @@ readme = "README.md"
 license = "GPL-3.0-or-later"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
-dependencies = ["anthropic>=2.3,<3"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Topic :: Communications :: Email :: Filters",
 ]
+# None by default: the relay calls the Messages API with the standard
+# library. The "sdk" extra is for RELAY_BACKEND=sdk (docs/backends.md).
+dependencies = []
+
+[project.optional-dependencies]
+sdk = ["anthropic>=2.3,<3"]
 
 [project.scripts]
 rspamd-anthropic-relay = "rspamd_anthropic_relay.relay:main"

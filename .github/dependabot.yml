@@ -1,0 +1,12 @@
+# Pull requests for new SDK pins (requirements-sdk.txt) and action
+# versions; each runs the parity tests (docs/backends.md)
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

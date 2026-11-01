@@ -3,8 +3,8 @@
 Messages API out.
 
 rspamd's gpt module speaks only the OpenAI Chat Completions format. This
-relay accepts that request on a local address, sends it to Claude through
-the official Anthropic SDK, and answers in the shape rspamd parses
+relay accepts that request on a local address, sends it to Claude
+(upstream.py: directly, or through the official Anthropic SDK), and answers in the shape rspamd parses
 (choices[0].message.content, finish_reason, usage). It is deliberately
 narrow: one endpoint, text only, no streaming, no tools.
 """
@@ -24,14 +24,21 @@ import sys
 import threading
 import time
 import zlib
+from collections.abc import Iterator
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-import anthropic
-
 from . import __version__
+from .upstream import (
+    BACKENDS,
+    UpstreamConnectionError,
+    UpstreamError,
+    UpstreamStatusError,
+    UpstreamTimeout,
+    make_client,
+)
 
 log = logging.getLogger("rspamd-anthropic-relay")
 
@@ -71,6 +78,13 @@ FINISH_REASONS = {
     "refusal": "content_filter",
 }
 
+# Sent to a connection over RELAY_MAX_CONNECTIONS before it is closed
+_REFUSED_BODY = b'{"error":{"message":"too many connections","type":"overloaded"}}'
+_REFUSED = (
+    b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\n"
+    b"Content-Length: %d\r\nConnection: close\r\n\r\n" % len(_REFUSED_BODY)
+) + _REFUSED_BODY
+
 
 class RequestError(Exception):
     """A client error: answered with an OpenAI-style error body."""
@@ -92,11 +106,14 @@ class Config:
     thinking: str = "disabled"  # disabled | adaptive | omit
     effort: str = "low"  # low | medium | high | xhigh | max | "" (omit)
     timeout: float = 4.5
-    max_body: int = 1024 * 1024
+    max_body: int = 512 * 1024
     max_concurrent: int = 4
     guard: bool = True
     max_input_chars: int = 100_000
     read_timeout: float = 10.0
+    idle_timeout: float = 60.0
+    max_connections: int = 32
+    backend: str = "direct"  # direct | sdk (upstream.py)
 
 
 def _parse_bool(name: str, value: str) -> bool:
@@ -163,6 +180,9 @@ def config_from_env(env: dict[str, str] | None = None) -> Config:
         guard=_parse_bool("RELAY_GUARD", env.get("RELAY_GUARD", "on")),
         max_input_chars=int(env.get("RELAY_MAX_INPUT_CHARS", Config.max_input_chars)),
         read_timeout=float(env.get("RELAY_READ_TIMEOUT", Config.read_timeout)),
+        idle_timeout=float(env.get("RELAY_IDLE_TIMEOUT", Config.idle_timeout)),
+        max_connections=int(env.get("RELAY_MAX_CONNECTIONS", Config.max_connections)),
+        backend=env.get("RELAY_BACKEND", Config.backend),
     )
     if not cfg.token:
         raise ValueError("RELAY_TOKEN (or RELAY_TOKEN_FILE) is required")
@@ -176,6 +196,14 @@ def config_from_env(env: dict[str, str] | None = None) -> Config:
         raise ValueError("RELAY_MAX_INPUT_CHARS must be at least 1")
     if cfg.read_timeout <= 0:
         raise ValueError("RELAY_READ_TIMEOUT must be positive")
+    if cfg.idle_timeout <= 0:
+        raise ValueError("RELAY_IDLE_TIMEOUT must be positive")
+    if cfg.max_concurrent < 1:
+        raise ValueError("RELAY_MAX_CONCURRENT must be at least 1")
+    if cfg.max_connections < cfg.max_concurrent:
+        raise ValueError("RELAY_MAX_CONNECTIONS must be at least RELAY_MAX_CONCURRENT")
+    if cfg.backend not in BACKENDS:
+        raise ValueError("RELAY_BACKEND must be " + " or ".join(BACKENDS))
     return cfg
 
 
@@ -237,7 +265,8 @@ def to_anthropic(request: Any, cfg: Config) -> dict[str, Any]:
         raise RequestError(HTTPStatus.BAD_REQUEST, "messages must be a non-empty list")
 
     system: list[str] = []
-    turns: list[dict[str, str]] = []
+    # (role, texts): consecutive messages of a role, joined once at the end
+    turns: list[tuple[str, list[str]]] = []
     chars = 0
     for m in messages:
         if not isinstance(m, dict):
@@ -253,16 +282,16 @@ def to_anthropic(request: Any, cfg: Config) -> dict[str, Any]:
         elif role in ("user", "assistant"):
             if not text.strip():
                 continue
-            if turns and turns[-1]["role"] == role:
-                turns[-1]["content"] += "\n" + text
+            if turns and turns[-1][0] == role:
+                turns[-1][1].append(text)
             else:
-                turns.append({"role": role, "content": text})
+                turns.append((role, [text]))
         else:
             raise RequestError(HTTPStatus.BAD_REQUEST, f"unsupported message role: {_printable(role, 40)}")
 
-    if not turns or turns[0]["role"] != "user":
+    if not turns or turns[0][0] != "user":
         raise RequestError(HTTPStatus.BAD_REQUEST, "the first non-system message must be from the user")
-    if turns[-1]["role"] != "user":
+    if turns[-1][0] != "user":
         raise RequestError(HTTPStatus.BAD_REQUEST, "the last message must be from the user")
 
     asked = request.get("max_completion_tokens") or request.get("max_tokens") or cfg.max_tokens
@@ -271,16 +300,19 @@ def to_anthropic(request: Any, cfg: Config) -> dict[str, Any]:
     except (TypeError, ValueError):
         raise RequestError(HTTPStatus.BAD_REQUEST, "max_tokens must be an integer") from None
 
+    out: list[dict[str, str]] = []
+    for role, texts in turns:
+        content = "\n".join(texts)
+        if cfg.guard and role == "user":
+            content = _wrap(content)
+        out.append({"role": role, "content": content})
     if cfg.guard:
-        for turn in turns:
-            if turn["role"] == "user":
-                turn["content"] = _wrap(turn["content"])
         system.append(GUARD)
 
     kwargs: dict[str, Any] = {
         "model": cfg.model,
         "max_tokens": max_tokens,
-        "messages": turns,
+        "messages": out,
     }
     if system:
         kwargs["system"] = "\n\n".join(system)
@@ -291,24 +323,37 @@ def to_anthropic(request: Any, cfg: Config) -> dict[str, Any]:
     return kwargs
 
 
-def to_openai(message: Any) -> dict[str, Any]:
-    """A chat completions response from an Anthropic Message. The reply
-    text loses the same invisible characters as the input: rspamd may put
-    its second line into a mail header."""
-    text = _clean("".join(b.text for b in message.content if getattr(b, "type", None) == "text"))
-    usage = message.usage
-    prompt = getattr(usage, "input_tokens", 0) or 0
-    completion = getattr(usage, "output_tokens", 0) or 0
+def _text_blocks(message: dict[str, Any]) -> Iterator[str]:
+    content = message.get("content")
+    for block in content if isinstance(content, list) else ():
+        if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str):
+            yield block["text"]
+
+
+def _tokens(usage: Any, key: str) -> int:
+    value = usage.get(key) if isinstance(usage, dict) else None
+    return value if isinstance(value, int) else 0
+
+
+def to_openai(message: dict[str, Any]) -> dict[str, Any]:
+    """A chat completions response from a Messages API response (its JSON).
+    The reply text loses the same invisible characters as the input:
+    rspamd may put its second line into a mail header."""
+    text = _clean("".join(_text_blocks(message)))
+    usage = message.get("usage")
+    prompt = _tokens(usage, "input_tokens")
+    completion = _tokens(usage, "output_tokens")
+    stop = message.get("stop_reason")
     return {
-        "id": message.id,
+        "id": str(message.get("id", "")),
         "object": "chat.completion",
         "created": int(time.time()),
-        "model": message.model,
+        "model": str(message.get("model", "")),
         "choices": [
             {
                 "index": 0,
                 "message": {"role": "assistant", "content": text},
-                "finish_reason": FINISH_REASONS.get(message.stop_reason or "", "stop"),
+                "finish_reason": FINISH_REASONS.get(stop if isinstance(stop, str) else "", "stop"),
             }
         ],
         "usage": {
@@ -329,50 +374,67 @@ def _decompress(body: bytes, limit: int) -> bytes:
 
 
 class Relay:
-    """The server's shared state: config, the Anthropic client, a limit."""
+    """The server's shared state: config, the upstream client, a limit."""
 
     def __init__(self, cfg: Config, client: Any):
         self.cfg = cfg
         self.client = client
         self.slots = threading.BoundedSemaphore(cfg.max_concurrent)
 
-    def complete(self, request: Any) -> tuple[HTTPStatus, dict[str, Any], dict[str, Any]]:
-        """Returns (status, response body, fields for the log line)."""
+    def prepare(self, request: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+        """(Messages API arguments, fields for the log line). The parsed
+        request is not needed after this, and is not kept during the call."""
         kwargs = to_anthropic(request, self.cfg)
         asked = request.get("model")
-        info: dict[str, Any] = {"model": self.cfg.model, "asked": None if asked is None else _printable(asked, 40)}
+        return kwargs, {"model": self.cfg.model, "asked": None if asked is None else _printable(asked, 40)}
+
+    def complete(self, kwargs: dict[str, Any], info: dict[str, Any]) -> dict[str, Any]:
+        """The response body; info gets the upstream fields."""
         try:
-            message = self.client.messages.create(**kwargs)
-        except anthropic.APITimeoutError:
+            message = self.client.create(kwargs)
+        except UpstreamTimeout:
             raise RequestError(HTTPStatus.GATEWAY_TIMEOUT, "upstream timeout", "timeout") from None
-        except anthropic.APIConnectionError:
+        except UpstreamConnectionError:
             raise RequestError(HTTPStatus.BAD_GATEWAY, "upstream connection error", "api_connection_error") from None
-        except anthropic.RateLimitError as e:
-            raise RequestError(HTTPStatus.TOO_MANY_REQUESTS, f"upstream rate limit ({e.request_id})", "rate_limit_error") from None
-        except anthropic.APIStatusError as e:
-            raise RequestError(HTTPStatus.BAD_GATEWAY, f"upstream status {e.status_code} ({e.request_id})", "api_error") from None
+        except UpstreamStatusError as e:
+            rid = _printable(e.request_id or "-", 64)
+            if e.status == 429:
+                raise RequestError(HTTPStatus.TOO_MANY_REQUESTS, f"upstream rate limit ({rid})", "rate_limit_error") from None
+            raise RequestError(HTTPStatus.BAD_GATEWAY, f"upstream status {e.status} ({rid})", "api_error") from None
+        except UpstreamError:
+            raise RequestError(HTTPStatus.BAD_GATEWAY, "invalid upstream response", "api_error") from None
+        reply = to_openai(message)
+        usage = message.get("usage") if isinstance(message.get("usage"), dict) else {}
         info.update(
-            id=message.id,
-            stop=message.stop_reason,
-            input=getattr(message.usage, "input_tokens", None),
-            output=getattr(message.usage, "output_tokens", None),
+            id=_printable(reply["id"], 64),
+            stop=_printable(message.get("stop_reason"), 20),
+            input=usage.get("input_tokens"),
+            output=usage.get("output_tokens"),
         )
-        return HTTPStatus.OK, to_openai(message), info
+        return reply
 
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = f"rspamd-anthropic-relay/{__version__}"
-    relay: Relay  # set on the subclass made by make_server
+    # Headers and body leave in one write: the buffered wfile is flushed
+    # once per request by handle_one_request (and by finish)
+    wbufsize = -1
+    disable_nagle_algorithm = True
+    relay: Relay  # set on the subclass made by make_server, with timeout
+    _body_read = False
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
-        log.debug("%s %s", self.address_string(), format % args)
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug("%s %s", self.address_string(), format % args)
 
     def _send(self, status: HTTPStatus, body: dict[str, Any]) -> None:
         data = json.dumps(body, separators=(",", ":")).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
+        if self.close_connection:
+            self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(data)
 
@@ -395,31 +457,29 @@ class Handler(BaseHTTPRequestHandler):
     def _body(self) -> Any:
         cfg = self.relay.cfg
         if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
-            self.close_connection = True
             raise RequestError(HTTPStatus.LENGTH_REQUIRED, "chunked bodies are not supported")
         try:
             length = int(self.headers.get("Content-Length", ""))
         except ValueError:
-            self.close_connection = True
             raise RequestError(HTTPStatus.LENGTH_REQUIRED, "Content-Length required") from None
         if length < 0 or length > cfg.max_body:
-            self.close_connection = True
             raise RequestError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "body too large")
-        # A client that announces a body and then stalls holds a thread;
-        # not for longer than this. Idle keep-alive connections are not
-        # limited, so rspamd's pooled connections stay open.
+        # A client that announces a body and then stalls holds a thread
+        # for read_timeout at most; between requests, idle_timeout applies
         self.connection.settimeout(cfg.read_timeout)
         try:
             body = self.rfile.read(length)
         except TimeoutError:
-            self.close_connection = True
             raise RequestError(HTTPStatus.REQUEST_TIMEOUT, "body not received in time", "timeout") from None
         finally:
-            self.connection.settimeout(None)
+            self.connection.settimeout(self.timeout)
+        if len(body) < length:
+            raise RequestError(HTTPStatus.BAD_REQUEST, "body cut short")
+        self._body_read = True
         encoding = self.headers.get("Content-Encoding", "identity").strip().lower()
         if encoding in ("gzip", "deflate", "x-gzip"):
             try:
-                body = _decompress(body, cfg.max_body)
+                body = _decompress(body, cfg.max_body)  # the compressed bytes go now
             except zlib.error:
                 raise RequestError(HTTPStatus.BAD_REQUEST, "cannot decompress body") from None
         elif encoding not in ("", "identity"):
@@ -434,26 +494,34 @@ class Handler(BaseHTTPRequestHandler):
         status: HTTPStatus = HTTPStatus.INTERNAL_SERVER_ERROR
         info: dict[str, Any] = {}
         acquired = False
+        self._body_read = False
         try:
             if self.path not in CHAT_PATHS:
                 raise RequestError(HTTPStatus.NOT_FOUND, "not found", "not_found")
-            # Read the body before any refusal, so a kept-alive connection
-            # stays in step
-            request = self._body()
+            # The token and a free slot are checked on the headers alone,
+            # so a refused request costs no body read, decompression or
+            # parse, and memory is bounded by RELAY_MAX_CONCURRENT
             if not self._authorized():
                 raise RequestError(HTTPStatus.UNAUTHORIZED, "invalid token", "authentication_error")
             acquired = self.relay.slots.acquire(blocking=False)
             if not acquired:
                 raise RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "too many requests in flight", "overloaded")
-            status, body, info = self.relay.complete(request)
+            kwargs, info = self.relay.prepare(self._body())
+            body = self.relay.complete(kwargs, info)
+            status = HTTPStatus.OK
             self._send(status, body)
         except RequestError as err:
             status = err.status
             info.setdefault("error", err.message)
+            # An unread body would be taken for the next request
+            if not self._body_read:
+                self.close_connection = True
             self._error(err)
         except Exception:
             log.exception("unexpected error")
             status = HTTPStatus.INTERNAL_SERVER_ERROR
+            if not self._body_read:
+                self.close_connection = True
             self._error(RequestError(status, "internal error", "internal_error"))
         finally:
             if acquired:
@@ -468,15 +536,55 @@ class Handler(BaseHTTPRequestHandler):
             )
 
 
-def make_server(cfg: Config, client: Any) -> ThreadingHTTPServer:
+class Server(ThreadingHTTPServer):
+    """A thread per connection, at most max_connections of them: past
+    that, a connection gets a 503 and is closed at once."""
+
+    daemon_threads = True
+
+    def __init__(self, address: tuple[str, int], handler: type[Handler], max_connections: int):
+        self.connections = threading.BoundedSemaphore(max_connections)
+        self.max_connections = max_connections
+        self._warned = 0.0
+        super().__init__(address, handler)
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        if not self.connections.acquire(blocking=False):
+            now = time.monotonic()
+            if now - self._warned > 10:
+                self._warned = now
+                log.warning("%d connections open, refusing more", self.max_connections)
+            try:
+                request.settimeout(1)
+                request.sendall(_REFUSED)
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self.connections.release()
+            raise
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.connections.release()
+
+
+class Server6(Server):
+    address_family = socket.AF_INET6
+
+
+def make_server(cfg: Config, client: Any) -> Server:
     relay = Relay(cfg, client)
-    handler = type("BoundHandler", (Handler,), {"relay": relay})
-    server_class = ThreadingHTTPServer
-    if ":" in cfg.host:
-        server_class = type("ThreadingHTTPServer6", (ThreadingHTTPServer,), {"address_family": socket.AF_INET6})
-    server = server_class((cfg.host, cfg.port), handler)
-    server.daemon_threads = True
-    return server
+    # timeout: StreamRequestHandler sets it on each connection, so an idle
+    # or silent one (no request line, no headers) is closed after it
+    handler = type("BoundHandler", (Handler,), {"relay": relay, "timeout": cfg.idle_timeout})
+    server_class = Server6 if ":" in cfg.host else Server
+    return server_class((cfg.host, cfg.port), handler, cfg.max_connections)
 
 
 def _setup_logging(target: str, facility: str, level: str) -> None:
@@ -524,13 +632,14 @@ def main(argv: list[str] | None = None) -> int:
         log.error("configuration: ANTHROPIC_API_KEY (or ANTHROPIC_API_KEY_FILE) is required")
         return 2
 
-    # The environment and --env-file both count, for the SDK's settings too
-    client = anthropic.Anthropic(
-        api_key=api_key,
-        base_url=env.get("ANTHROPIC_BASE_URL") or None,
-        timeout=cfg.timeout,
-        max_retries=0,
-    )
+    try:
+        client = make_client(cfg.backend, api_key, env.get("ANTHROPIC_BASE_URL") or None, cfg.timeout, cfg.max_concurrent)
+    except ImportError:
+        log.error("configuration: RELAY_BACKEND=sdk needs the SDK: pip install --require-hashes -r requirements-sdk.txt (docs/backends.md)")
+        return 2
+    except ValueError as e:
+        log.error("configuration: %s", e)
+        return 2
     server = make_server(cfg, client)
 
     def stop(signum: int, _frame: Any) -> None:
@@ -540,9 +649,9 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     log.info(
-        "listening on %s:%d, model %s, thinking %s, effort %s, max_tokens %d, timeout %.1fs, guard %s",
-        cfg.host, cfg.port, cfg.model, cfg.thinking, cfg.effort or "default", cfg.max_tokens, cfg.timeout,
-        "on" if cfg.guard else "off",
+        "listening on %s:%d, backend %s, model %s, thinking %s, effort %s, max_tokens %d, timeout %.1fs, guard %s",
+        cfg.host, cfg.port, cfg.backend, cfg.model, cfg.thinking, cfg.effort or "default", cfg.max_tokens,
+        cfg.timeout, "on" if cfg.guard else "off",
     )
     if cfg.host not in ("127.0.0.1", "::1", "localhost"):
         log.warning("listening on %s: the relay has no TLS, and the token is sent in the clear", cfg.host)
@@ -550,4 +659,5 @@ def main(argv: list[str] | None = None) -> int:
         server.serve_forever()
     finally:
         server.server_close()
+        client.close()
     return 0
