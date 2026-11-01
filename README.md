@@ -95,12 +95,21 @@ mail's attempt usually ends up cited in the reason line. The scores
 rspamd assigns to `GPT_*` symbols remain the real limit on the damage:
 keep them below what rejects mail on their own.
 
-Two rspamd settings matter here. With `context` enabled, the module adds
-a summary of the sender's earlier mail; set `context.as_system = false`
-so it goes in as a user message and is wrapped with the mail: it is
-built from the sender's earlier mail and the model's verdicts on it,
-not written by you. And `reason_header` writes the model's reason line,
-which may quote the mail, into every message's headers.
+Three rspamd settings matter here:
+
+- With `context` enabled, the module adds a summary of the sender's
+  earlier mail. It is built from that mail and the model's verdicts on
+  it, not written by you, so set `context.as_system = false`: it then goes
+  in as a user message and is wrapped with the mail.
+- `context_augment` (4.0 and later) adds a snippet your own Lua code
+  writes. It joins the `context` summary in one snippet, and
+  `context.as_system` places both: as a system message by default,
+  outside the tags. If you want trusted facts in the system prompt and
+  also the sender history, the history goes in the system prompt as
+  well. Run one of them, or put only text you wrote in the snippet and
+  leave `context` off.
+- `reason_header` writes the model's reason line, which may quote the
+  mail, into every message's headers.
 
 ## Install
 
@@ -178,25 +187,101 @@ autolearn = false;
 enabled = true;
 ```
 
-Things to know about the module (rspamd 3.14):
+Things to know about the module (checked against rspamd 4.2.3; 3.14
+where it differs):
 
-- It skips mail that is already decided: a reject with more than one
-  positive symbol, and anything scoring below zero (unless `allow_ham`).
-  What it sends is the subject, the sender, the link domains and the
-  text, cut to about `max_tokens`.
+- It skips mail that is already decided: passthrough results, a reject
+  with more than one positive symbol, and anything with no action and a
+  score below zero (unless `allow_ham`). It also skips mail carrying
+  `WHITELIST_SPF`, `WHITELIST_DKIM`, `WHITELIST_DMARC`, `FUZZY_DENIED`,
+  `REPLY` or `BOUNCE` (`symbols_to_except`). What it sends is the
+  subject, the sender, the link domains and the text, cut to about
+  `max_tokens`.
+- Below zero is a lot to skip: a message with nothing against it often
+  scores a little under zero (`MIME_GOOD`, `R_SPF_ALLOW`), so plain
+  phishing from a new sender is never asked about. A `condition` of your
+  own can set the line elsewhere (below).
+- `BAYES_SPAM` is meant to be skipped too, from a weight of 0.9. In 4.2.3
+  that check reads `sym.weight` from `task:get_symbol()`, which returns
+  a list, so it never skips. Check `sym[1].score` in your own condition if
+  you rely on it.
 - It runs as a postfilter, within rspamd's `task_timeout` (8 s by
-  default). Keep `timeout` under that and `RELAY_TIMEOUT` under `timeout`.
+  default). The module's own `timeout` defaults to 10 s, more than that.
+  rspamd warns at start when `task_timeout` is below the longest chain of
+  symbol timeouts (`configured task_timeout … is less than maximum
+  symbols cache timeout`), and a symbol past it is cut off. Keep
+  `RELAY_TIMEOUT` under the module's `timeout`, and `task_timeout` above
+  the longest chain the warning names.
 - Its symbols: `GPT_SPAM` up to +3 and `GPT_HAM` down to −2 (scaled by the
   probability), plus `GPT_PHISHING`, `GPT_SCAM` and `GPT_MALWARE` at +3
-  each. Together they can move a message by 6 points or more; review the
-  weights against your actions before letting it decide anything.
+  each. `GPT_MARKETING` and `GPT_UNCERTAIN` score 0. Each is a separate
+  symbol: a spam verdict with a category adds both, and together they can
+  move a message by 6 points or more. Review the weights against your
+  actions before letting it decide anything.
 - `autolearn = true` would train bayes on the model's verdicts, and its
   mistakes would then reinforce themselves. Leave it off.
-- `context` and `reason_header`: see "Untrusted input".
-- It needs redis: in 3.14.3, without a redis server for rspamd the
-  module skips every request (the log says `lua_cache.lua: missing
+- `context`, `context_augment` and `reason_header`: see "Untrusted input".
+- It needs redis: in 3.14.3 and 4.2.3, without a redis server for rspamd
+  the module skips every request (the log says `lua_cache.lua: missing
   required parameters for cache_get` at info level, nothing else).
-  Verdicts are cached there.
+  Verdicts are cached there, for each text part and prompt. In 4.2.3 the
+  key leaves out the context snippet, so a verdict reached with one set
+  of facts is reused for the same text with other facts.
+
+### Your own condition
+
+`condition` is Lua code returning the function the module calls instead
+of its own. What the function returns changed in 4.1.5:
+
+- 4.1.5 and later: `true` to ask the model, or `false` and a reason for
+  the debug log. The module builds the text itself.
+- Before 4.1.5 (3.14 too): `true` and the content to send, built by the
+  function. A condition written for 4.1.5 gives older versions nothing
+  to send; an older one still works on 4.1.5, which ignores the content.
+
+The default's rules with a lower ham line (here −2), for 4.1.5 and later:
+
+```
+condition = <<EOD
+return function(task)
+  local res = task:get_metric_result()
+  if res then
+    if res.passthrough then return false, 'passthrough' end
+    if res.action == 'reject' and res.npositive > 1 then return false, 'already decided as spam' end
+    if res.action == 'no action' and res.score < -2 then return false, 'clear ham' end
+  end
+  local except = { BAYES_SPAM = 0.9, WHITELIST_SPF = 0, WHITELIST_DKIM = 0,
+    WHITELIST_DMARC = 0, FUZZY_DENIED = 0, REPLY = 0, BOUNCE = 0 }
+  for s, w in pairs(except) do
+    if task:has_symbol(s) then
+      local sym = task:get_symbol(s)
+      local score = sym and sym[1] and sym[1].score or 0
+      if w == 0 or math.abs(score) >= w then return false, 'skip as ' .. s .. ' is found' end
+    end
+  end
+  return true
+end
+EOD
+```
+
+### Facts of your own: context_augment
+
+Since 4.0 the module can add a snippet that your own Lua code writes to
+each request: `context_augment` is code returning
+`function(task, content, cb)`, which calls `cb(snippet)` (or `cb(nil)`
+to add nothing). The snippet can hold what rspamd knows and the mail
+cannot say for itself: whether the sender wrote here before, the
+authentication results, the attachments' real types.
+
+```
+context_augment = "return function(task, content, cb) cb('Sender: first message from this address.') end";
+```
+
+It goes in as a second system message, outside the relay's `<email>`
+tags, unless `context.as_system = false` (see "Untrusted input"). Keep it
+to facts rspamd worked out: a subject, a display name or a whole file
+name copied into it
+is text from the sender, now in the trusted channel.
 
 **Privacy**: every message the module checks is sent to Anthropic. Make
 sure that is acceptable for the mail you handle.
