@@ -2,7 +2,7 @@
 # The account the relay runs as; it must be able to read RELAY_ENV_FILE
 # and the files it names.
 #RELAY_USER="rspamd-relay"
-# The Python that has the anthropic SDK (a virtualenv, see README.md)
+# The Python the relay is installed for (a virtualenv, see README.md)
 #RELAY_PYTHON="/opt/rspamd-anthropic-relay/venv/bin/python"
 # Set when running from a checkout instead of an installed package: the
 # checkout's src directory

@@ -1,9 +1,17 @@
 name: test
-on: [push, pull_request]
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Weekly: the parity tests against the newest SDK (sdk-latest), which
+    # say when the direct client has fallen behind it (docs/backends.md)
+    - cron: "17 6 * * 1"
 permissions:
   contents: read
 jobs:
   test:
+    # The default install: no dependencies, SDK parity tests skipped
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -14,6 +22,38 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - run: python -m pip install --require-hashes -r requirements.txt
       - run: python -m pip install --no-deps -e .
+      - run: python -m unittest discover -s tests -v
+
+  sdk:
+    # The pinned SDK (requirements-sdk.txt): RELAY_BACKEND=sdk, and the
+    # direct client checked against it
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install --require-hashes -r requirements-sdk.txt
+      - run: python -m pip install --no-deps -e .
+      - run: python -m unittest discover -s tests -v
+
+  sdk-latest:
+    # The newest SDK release, unpinned. A failure here is news from
+    # upstream (a new anthropic-version, header or field), not a broken
+    # commit: read the SDK's changelog, then update upstream.py and the pins
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - run: python -m pip install --upgrade "anthropic>=2.3"
+      - run: python -m pip install --no-deps -e .
+      - run: python -c "import anthropic; print('anthropic', anthropic.__version__)"
       - run: python -m unittest discover -s tests -v

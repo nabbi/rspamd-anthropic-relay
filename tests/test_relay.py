@@ -4,11 +4,8 @@ import http.client
 import json
 import socket
 import threading
+import time
 import unittest
-from types import SimpleNamespace
-
-import anthropic
-import httpx2
 
 from rspamd_anthropic_relay.relay import (
     GUARD,
@@ -20,6 +17,12 @@ from rspamd_anthropic_relay.relay import (
     make_server,
     to_anthropic,
     to_openai,
+)
+from rspamd_anthropic_relay.upstream import (
+    UpstreamConnectionError,
+    UpstreamProtocolError,
+    UpstreamStatusError,
+    UpstreamTimeout,
 )
 
 TOKEN = "test-token"
@@ -40,13 +43,16 @@ RSPAMD_REQUEST = {
 
 
 def message(text="0.92\nInvoice lure from an unknown sender\nphishing", stop="end_turn"):
-    return SimpleNamespace(
-        id="msg_test",
-        model="claude-haiku-5-5",
-        stop_reason=stop,
-        content=[SimpleNamespace(type="text", text=text)],
-        usage=SimpleNamespace(input_tokens=120, output_tokens=14),
-    )
+    """A Messages API response, as its JSON"""
+    return {
+        "id": "msg_test",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-haiku-5-5",
+        "stop_reason": stop,
+        "content": [{"type": "text", "text": text}],
+        "usage": {"input_tokens": 120, "output_tokens": 14},
+    }
 
 
 class FakeClient:
@@ -54,10 +60,11 @@ class FakeClient:
         self.calls = []
         self.result = result or message()
         self.error = error
-        self.messages = self
+        self.delay = 0
 
-    def create(self, **kwargs):
-        self.calls.append(kwargs)
+    def create(self, body):
+        self.calls.append(body)
+        time.sleep(self.delay)
         if self.error:
             raise self.error
         return self.result
@@ -174,11 +181,16 @@ class ConversionTest(unittest.TestCase):
         # The reply loses invisible characters too: rspamd may put line 2 in a header
         odd = to_openai(message(text="0.9\nReason\x1b[0m\U000e0041 here\r\nspam"))
         self.assertEqual(odd["choices"][0]["message"]["content"], "0.9\nReason[0m here\r\nspam")
+        # Odd shapes from upstream become an empty reply, not a crash
+        empty = to_openai({"content": [{"type": "text", "text": 5}, "x", {"type": "thinking"}], "usage": None})
+        self.assertEqual(empty["choices"][0]["message"]["content"], "")
+        self.assertEqual(empty["usage"]["total_tokens"], 0)
 
     def test_config(self):
         cfg = config_from_env({"RELAY_TOKEN": "t", "RELAY_LISTEN": "[::1]:9000", "RELAY_EFFORT": ""})
         self.assertEqual((cfg.host, cfg.port, cfg.effort), ("::1", 9000, ""))
         self.assertEqual((cfg.guard, cfg.max_input_chars, cfg.read_timeout), (True, 100_000, 10.0))
+        self.assertEqual((cfg.backend, cfg.max_body, cfg.idle_timeout, cfg.max_connections), ("direct", 524288, 60.0, 32))
         cfg = config_from_env({"RELAY_TOKEN": "t", "RELAY_GUARD": "off", "RELAY_MAX_INPUT_CHARS": "5000", "RELAY_READ_TIMEOUT": "2"})
         self.assertEqual((cfg.guard, cfg.max_input_chars, cfg.read_timeout), (False, 5000, 2.0))
         for env in (
@@ -188,6 +200,9 @@ class ConversionTest(unittest.TestCase):
             {"RELAY_TOKEN": "t", "RELAY_GUARD": "maybe"},
             {"RELAY_TOKEN": "t", "RELAY_MAX_INPUT_CHARS": "0"},
             {"RELAY_TOKEN": "t", "RELAY_READ_TIMEOUT": "0"},
+            {"RELAY_TOKEN": "t", "RELAY_IDLE_TIMEOUT": "0"},
+            {"RELAY_TOKEN": "t", "RELAY_MAX_CONNECTIONS": "2"},  # under RELAY_MAX_CONCURRENT
+            {"RELAY_TOKEN": "t", "RELAY_BACKEND": "curl"},
         ):
             with self.subTest(env=env), self.assertRaises(ValueError):
                 config_from_env(env)
@@ -207,10 +222,28 @@ class EnvFileTest(unittest.TestCase):
             load_env_file(f.name)
 
 
+def read_response(sock):
+    """(status line, headers, body) of one response, read off a raw socket"""
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise ConnectionError(f"closed after {data!r}")
+        data += chunk
+    head, body = data.split(b"\r\n\r\n", 1)
+    lines = head.split(b"\r\n")
+    headers = {k.lower(): v for k, v in (line.split(b": ", 1) for line in lines[1:])}
+    while len(body) < int(headers[b"content-length"]):
+        body += sock.recv(4096)
+    return lines[0], headers, body
+
+
 class ServerTest(unittest.TestCase):
+    config = Config(port=0, token=TOKEN, max_body=4096, read_timeout=0.3, idle_timeout=0.5, max_connections=6)
+
     def setUp(self):
         self.client = FakeClient()
-        self.server = make_server(Config(port=0, token=TOKEN, max_body=4096, read_timeout=0.3), self.client)
+        self.server = make_server(self.config, self.client)
         self.port = self.server.server_address[1]
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -227,10 +260,15 @@ class ServerTest(unittest.TestCase):
             headers["Content-Encoding"] = "gzip"
         if token is not None:
             headers["Authorization"] = f"Bearer {token}"
+        own = conn is None
         conn = conn or http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
-        conn.request("POST", path, body=data, headers=headers)
-        resp = conn.getresponse()
-        return resp.status, json.loads(resp.read())
+        try:
+            conn.request("POST", path, body=data, headers=headers)
+            resp = conn.getresponse()
+            return resp.status, json.loads(resp.read())
+        finally:
+            if own:
+                conn.close()
 
     def test_gzipped_rspamd_request_kept_alive(self):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
@@ -238,12 +276,91 @@ class ServerTest(unittest.TestCase):
             status, body = self.post(RSPAMD_REQUEST, gzipped=True, conn=conn)
             self.assertEqual(status, 200)
             self.assertTrue(body["choices"][0]["message"]["content"].startswith("0.92"))
+        conn.close()
         self.assertEqual(len(self.client.calls), 2)
+
+    def raw(self, data):
+        sock = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        sock.sendall(data)
+        return sock
 
     def test_auth(self):
         self.assertEqual(self.post(RSPAMD_REQUEST, token="wrong")[0], 401)
         self.assertEqual(self.post(RSPAMD_REQUEST, token=None)[0], 401)
         self.assertEqual(self.client.calls, [])
+
+    def test_refused_before_the_body(self):
+        # A wrong token is answered on the headers: the announced body is
+        # never waited for (it would take RELAY_READ_TIMEOUT) and the
+        # connection is closed, since its unread body would come next
+        for headers, status in (
+            (b"Authorization: Bearer wrong\r\n", b"401"),
+            (b"Authorization: Bearer " + TOKEN.encode() + b"\r\n", None),
+        ):
+            if status is None:  # all slots busy: 503, same treatment
+                self.server.RequestHandlerClass.relay.slots = threading.BoundedSemaphore(1)
+                self.server.RequestHandlerClass.relay.slots.acquire()
+                status = b"503"
+            started = time.monotonic()
+            sock = self.raw(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n" + headers + b"Content-Length: 4000\r\n\r\n{")
+            line, got, _ = read_response(sock)
+            self.assertIn(status, line)
+            self.assertEqual(got[b"connection"], b"close")
+            self.assertLess(time.monotonic() - started, 0.25)
+            self.assertEqual(sock.recv(1), b"")
+            sock.close()
+        self.assertEqual(self.client.calls, [])
+
+    def test_response_in_one_write(self):
+        sock = self.raw(b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n")
+        sock.settimeout(2)
+        data = sock.recv(65536)  # headers and body in one segment
+        self.assertTrue(data.startswith(b"HTTP/1.1 200"))
+        self.assertTrue(data.endswith(b'{"status":"ok"}'), data)
+        sock.close()
+
+    def test_idle_connection_closed(self):
+        # Silent (no request line) and idle keep-alive connections are
+        # closed after RELAY_IDLE_TIMEOUT instead of holding a thread
+        silent = self.raw(b"")
+        kept = self.raw(b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n")
+        read_response(kept)
+        for sock in (silent, kept):
+            sock.settimeout(3)
+            started = time.monotonic()
+            self.assertEqual(sock.recv(1), b"")
+            self.assertLess(time.monotonic() - started, 2)
+            sock.close()
+
+    def test_connection_cap(self):
+        socks = [self.raw(b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n") for _ in range(6)]
+        for sock in socks:
+            read_response(sock)  # all six served and kept open
+        extra = self.raw(b"")
+        line, _, body = read_response(extra)
+        self.assertIn(b"503", line)
+        self.assertIn(b"too many connections", body)
+        self.assertEqual(extra.recv(1), b"")
+        extra.close()
+        socks.pop().close()
+        deadline = time.monotonic() + 2
+        while True:  # the freed slot is taken again
+            sock = self.raw(b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n")
+            line, _, _ = read_response(sock)
+            sock.close()
+            if b"200" in line or time.monotonic() > deadline:
+                break
+            time.sleep(0.05)
+        self.assertIn(b"200", line)
+        for sock in socks:
+            sock.close()
+
+    def test_unknown_path_closes(self):
+        # 404 before the body: the connection is not reused
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        self.assertEqual(self.post(RSPAMD_REQUEST, path="/v1/embeddings", conn=conn)[0], 404)
+        self.assertEqual(self.post(RSPAMD_REQUEST, conn=conn)[0], 200)  # on a new connection
+        conn.close()
 
     def test_bad_requests(self):
         self.assertEqual(self.post(b"not json")[0], 400)
@@ -257,15 +374,12 @@ class ServerTest(unittest.TestCase):
     def test_stalled_body(self):
         # A body that is announced but never arrives holds a thread only
         # for RELAY_READ_TIMEOUT, then gets 408 and the connection closed
-        sock = socket.create_connection(("127.0.0.1", self.port), timeout=5)
-        sock.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n{\"mess")
-        reply = b""
-        while b"\r\n\r\n" not in reply:
-            reply += sock.recv(4096)
-        self.assertTrue(reply.startswith(b"HTTP/1.1 408"), reply)
-        body = reply.split(b"\r\n\r\n", 1)[1]
-        while len(body) < int(dict(line.split(b": ", 1) for line in reply.split(b"\r\n\r\n")[0].split(b"\r\n")[1:])[b"Content-Length"]):
-            body += sock.recv(4096)
+        sock = self.raw(
+            b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer "
+            + TOKEN.encode() + b"\r\nContent-Length: 100\r\n\r\n{\"mess"
+        )
+        line, _, _ = read_response(sock)
+        self.assertTrue(line.startswith(b"HTTP/1.1 408"), line)
         self.assertEqual(sock.recv(1), b"")  # closed by the relay
         sock.close()
         self.assertEqual(self.client.calls, [])
@@ -274,14 +388,16 @@ class ServerTest(unittest.TestCase):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
         conn.request("GET", "/healthz")
         self.assertEqual(conn.getresponse().status, 200)
+        conn.close()
 
     def test_upstream_errors(self):
-        request = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
         cases = [
-            (anthropic.APITimeoutError(request=request), 504),
-            (anthropic.APIConnectionError(request=request), 502),
-            (anthropic.InternalServerError("boom", response=httpx2.Response(500, request=request), body=None), 502),
-            (anthropic.RateLimitError("slow", response=httpx2.Response(429, request=request), body=None), 429),
+            (UpstreamTimeout("timeout"), 504),
+            (UpstreamConnectionError("refused"), 502),
+            (UpstreamStatusError(500, "req_1"), 502),
+            (UpstreamStatusError(529, None), 502),
+            (UpstreamStatusError(429, "req_2"), 429),
+            (UpstreamProtocolError("not JSON"), 502),
         ]
         for error, status in cases:
             with self.subTest(error=type(error).__name__):
