@@ -7,7 +7,7 @@ name = "rspamd-anthropic-relay"
 dynamic = ["version"]
 description = "Relay rspamd's gpt module (OpenAI chat completions) to Anthropic's Messages API"
 readme = "README.md"
-license = "MIT"
+license = "GPL-3.0-or-later"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
 dependencies = ["anthropic>=2.3,<3"]
