@@ -1,0 +1,31 @@
+#!/sbin/openrc-run
+# rspamd-anthropic-relay: OpenAI-style chat completions (rspamd's gpt
+# module) to Anthropic's Messages API. Settings: /etc/conf.d/rspamd-anthropic-relay
+
+description="Relay rspamd's gpt module to Anthropic's Messages API"
+
+: "${RELAY_USER:=rspamd-relay}"
+: "${RELAY_PYTHON:=/opt/rspamd-anthropic-relay/venv/bin/python}"
+: "${RELAY_ENV_FILE:=/etc/rspamd-anthropic-relay/env}"
+
+supervisor="supervise-daemon"
+command="${RELAY_PYTHON}"
+command_args="-m rspamd_anthropic_relay --log syslog --env-file ${RELAY_ENV_FILE}"
+command_user="${RELAY_USER}"
+respawn_delay=5
+respawn_max=10
+respawn_period=300
+# A checkout instead of an installed package: its src directory
+if [ -n "${RELAY_SRC}" ]; then
+	supervise_daemon_args="--env PYTHONPATH=${RELAY_SRC}"
+fi
+
+depend() {
+	need net
+	use logger dns
+	before rspamd
+}
+
+start_pre() {
+	checkpath -f -m 0600 -o "${RELAY_USER}" "${RELAY_ENV_FILE}"
+}

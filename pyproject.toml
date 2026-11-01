@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rspamd-anthropic-relay"
+dynamic = ["version"]
+description = "Relay rspamd's gpt module (OpenAI chat completions) to Anthropic's Messages API"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+dependencies = ["anthropic>=2.3,<3"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Communications :: Email :: Filters",
+]
+
+[project.scripts]
+rspamd-anthropic-relay = "rspamd_anthropic_relay.relay:main"
+
+[project.urls]
+Homepage = "https://github.com/nabbi/rspamd-anthropic-relay"
+
+[tool.setuptools.dynamic]
+version = {attr = "rspamd_anthropic_relay.__version__"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
