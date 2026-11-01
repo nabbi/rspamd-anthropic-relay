@@ -53,7 +53,7 @@ verdict costs little.
 
 ## Install
 
-Python 3.10 or later.
+Python 3.11 or later (the pinned httpx2 stack needs it).
 
 ```sh
 python3 -m venv /opt/rspamd-anthropic-relay/venv
