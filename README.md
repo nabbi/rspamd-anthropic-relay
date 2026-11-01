@@ -280,8 +280,7 @@ context_augment = "return function(task, content, cb) cb('Sender: first message 
 It goes in as a second system message, outside the relay's `<email>`
 tags, unless `context.as_system = false` (see "Untrusted input"). Keep it
 to facts rspamd worked out: a subject, a display name or a whole file
-name copied into it
-is text from the sender, now in the trusted channel.
+name copied into it is text from the sender, now in the trusted channel.
 
 **Privacy**: every message the module checks is sent to Anthropic. Make
 sure that is acceptable for the mail you handle.
