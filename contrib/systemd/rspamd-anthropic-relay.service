@@ -11,13 +11,33 @@ Environment=RELAY_ENV_FILE=/etc/rspamd-anthropic-relay/env
 ExecStart=/opt/rspamd-anthropic-relay/venv/bin/rspamd-anthropic-relay --log syslog
 Restart=on-failure
 RestartSec=5
+# It reads its settings file and talks HTTP; nothing else
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+UMask=0077
 MemoryMax=200M
+TasksMax=64
 
 [Install]
 WantedBy=multi-user.target
